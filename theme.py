@@ -37,6 +37,7 @@ _PALETTES = {
         "red": "#ff453a",
         "yellow": "#ffd60a",
         "teal": "#5ac8fa",
+        "teal_hover": "#7ad4fb",
         "teal_sel": "#2a7a9e",
         "teal_btn": "#2a7a9e",
         "teal_btn_hover": "#3a8aae",
@@ -68,6 +69,7 @@ _PALETTES = {
         "red": "#ff3b30",
         "yellow": "#ff9500",
         "teal": "#32ade6",
+        "teal_hover": "#5ab8e6",
         "teal_sel": "#5ab8e6",
         "teal_btn": "#32ade6",
         "teal_btn_hover": "#5ab8e6",
@@ -271,6 +273,9 @@ class _MacButtonWrapper:
 
     def pack(self, **kwargs):
         return self._frame.pack(**kwargs)
+
+    def pack_forget(self):
+        return self._frame.pack_forget()
 
     def place(self, **kwargs):
         return self._frame.place(**kwargs)

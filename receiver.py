@@ -258,6 +258,16 @@ class ReceiverGUI:
                 if not ok:
                     raise RuntimeError("Could not retrieve chunk " + str(i))
 
+            self.prog.set(85, "Saving chunks…", self.root)
+            # Save individual chunks to a subfolder
+            chunks_dir = os.path.join(outdir, fn + "_chunks")
+            os.makedirs(chunks_dir, exist_ok=True)
+            for i in range(total):
+                chunk_path = os.path.join(chunks_dir, "chunk_" + str(i))
+                with open(chunk_path, "wb") as f:
+                    f.write(retrieved[i]["data"])
+            log("Saved " + str(total) + " chunks to " + chunks_dir)
+
             self.prog.set(95, "Reassembling file…", self.root)
             outpath = os.path.join(outdir, fn)
             chunk_list = list(retrieved.values())
@@ -267,7 +277,8 @@ class ReceiverGUI:
             self.prog.set(100, "Saved to " + outpath, self.root)
             log("File reconstructed -> " + outpath)
             self.root.after(0, lambda: messagebox.showinfo(
-                "Download Complete", "'" + fn + "' saved to:\n" + outpath))
+                "Download Complete",
+                "'" + fn + "' saved to:\n" + outpath + "\n\nChunks saved to:\n" + chunks_dir))
 
         except Exception as e:
             err_msg = str(e)
@@ -340,11 +351,21 @@ def run_cli(tracker_host, tracker_port):
                     log("Failed chunk " + str(i) + " from " + p["peer_id"] + ": " + str(e))
             if not ok:
                 raise RuntimeError("Could not retrieve chunk " + str(i))
+        # Save individual chunks
+        chunks_dir = os.path.join(outdir, fn + "_chunks")
+        os.makedirs(chunks_dir, exist_ok=True)
+        for i in range(total):
+            chunk_path = os.path.join(chunks_dir, "chunk_" + str(i))
+            with open(chunk_path, "wb") as f:
+                f.write(retrieved[i]["data"])
+        log("Saved " + str(total) + " chunks to " + chunks_dir)
+        # Reassemble full file
         outpath = os.path.join(outdir, fn)
         if not reassemble_file(list(retrieved.values()), outpath):
             raise RuntimeError("Reassembly failed — hash mismatch")
         log("File reconstructed -> " + outpath)
         print("\nSaved to: " + outpath)
+        print("Chunks saved to: " + chunks_dir)
     except Exception as e:
         log("ERROR: " + str(e))
         print("\nDownload failed: " + str(e))

@@ -80,6 +80,9 @@ def handle_peer_client(conn, addr):
                     send_json(conn, {"status": "ok", "hash": chunk["hash"]})
                     send_bytes(conn, chunk["data"])
                     log("Served chunk " + str(idx) + " of " + fn)
+            # external peer connection check - acknowledgement that peer is running
+            elif t == "PING":
+                send_json(conn, {"status": "ok", "type": "PONG"})
             else:
                 # unknown message type
                 send_json(conn, {"error": "unknown"})
@@ -128,6 +131,7 @@ def stop_peer(port):
 def register_with_tracker(th, tp, pid, ph, pp):
     try:
         s = socket.socket()
+        s.settimeout(3)
         s.connect((th, tp))
         send_json(s, {"type": "REGISTER_PEER", "peer_id": pid, "host": ph, "port": pp})
         r = recv_json(s)
@@ -141,6 +145,7 @@ def register_with_tracker(th, tp, pid, ph, pp):
 def unregister_with_tracker(th, tp, pid):
     try:
         s = socket.socket()
+        s.settimeout(3)
         s.connect((th, tp))
         send_json(s, {"type": "UNREGISTER_PEER", "peer_id": pid})
         recv_json(s)
@@ -149,7 +154,7 @@ def unregister_with_tracker(th, tp, pid):
         pass
 
 
-# quick check if a peer is actually running and accepting connections
+# quick check if a peer is actually running and accepting connections (local peers)
 def verify_peer(host, port):
     try:
         s = socket.socket()
@@ -158,6 +163,33 @@ def verify_peer(host, port):
         s.close()
         return True
     except Exception:
+        return False
+
+
+# verify external peer is running by sending PING and expecting PONG acknowledgement
+def verify_external_peer(host, port):
+    try:
+        s = socket.socket()
+        s.settimeout(10)
+        s.connect((host, port))
+        send_json(s, {"type": "PING"})
+        r = recv_json(s)
+        s.close()
+        if r.get("status") == "ok" and r.get("type") == "PONG":
+            return True
+        log("External peer at " + host + ":" + str(port) + " sent unexpected response: " + str(r))
+        return False
+    except socket.timeout:
+        log("Connection to " + host + ":" + str(port) + " timed out (is external_peer.py running?)")
+        return False
+    except ConnectionRefusedError:
+        log("Connection refused to " + host + ":" + str(port) + " (is external_peer.py running on that device?)")
+        return False
+    except OSError as e:
+        log("Cannot reach " + host + ":" + str(port) + ": " + str(e))
+        return False
+    except Exception as e:
+        log("Error connecting to external peer: " + str(e))
         return False
 
 
@@ -200,7 +232,8 @@ class HubGUI:
         self.root = root
         _root = root
         self._filepath = None  # path of file user picked to send
-        self._peer_rows = []   # list of (pid_var, host_var, port_var, status_label, start_btn, stop_btn)
+        # list of (pid_var, host_var, port_var, type_var, status_lbl, start_btn, stop_btn, connect_btn, disconnect_btn)
+        self._peer_rows = []
         c = T.current()
 
         # so tracker can write to our log widget
@@ -351,7 +384,7 @@ class HubGUI:
         btn_row.pack(fill="x")
         T.register(lambda f=btn_row: f.configure(bg=T.current()["card"]))
         T.ghost_button(btn_row, "Add Peer", command=self._on_add_peer).pack(side="left", padx=(0, 10))
-        T.accent_button(btn_row, "Start All", "grey", command=self._start_all_peers, padx=24, pady=10).pack(side="left")
+        T.accent_button(btn_row, "Connect All", "teal", command=self._connect_all_peers, padx=24, pady=10).pack(side="left")
 
         # add 2 default peers to start with
         self._add_peer("peer1", "127.0.0.1", "9001")
@@ -463,8 +496,8 @@ class HubGUI:
         self._chunks_stat.config(text=str(n))
         self.root.after(1000, self._poll_stats)
 
-    # add one peer row to the list (ID, host, port, status, start button)
-    def _add_peer(self, pid="", ph="127.0.0.1", pp="9003"):
+    # add one peer row to the list (ID, host, port, type, status, buttons)
+    def _add_peer(self, pid="", ph="127.0.0.1", pp="9003", peer_type="local"):
         c = T.current()
         row = tk.Frame(self._peers_card, bg=c["card"], pady=6)
         row._level = "card"
@@ -475,6 +508,7 @@ class HubGUI:
         pid_v = tk.StringVar(value=pid)
         ph_v = tk.StringVar(value=ph)
         pp_v = tk.StringVar(value=pp)
+        type_var = tk.StringVar(value=peer_type)
 
         def _lbl(t, w=4):
             l = tk.Label(row, text=t, font=T.font(12), fg=c["text3"], bg=c["card"], width=w, anchor="e")
@@ -483,6 +517,15 @@ class HubGUI:
             l.pack(side="left", padx=4)
             T.register(lambda w=l: w.configure(bg=T.current()["card"], fg=T.current()["text3"]))
 
+        type_frame = tk.Frame(row, bg=c["card"])
+        type_frame._level = "card"
+        type_frame.pack(side="left", padx=4)
+        T.register(lambda f=type_frame: f.configure(bg=T.current()["card"]))
+        type_lbl = tk.Label(type_frame, text="Type", font=T.font(12), fg=c["text3"], bg=c["card"],
+            width=5, anchor="e")
+        type_lbl.pack(side="left", padx=4)
+        T.register(lambda w=type_lbl: w.configure(bg=T.current()["card"], fg=T.current()["text3"]))
+
         _lbl("ID", 4)
         T.styled_entry(row, pid_v, width=8, accent="teal").pack(side="left", ipady=5, padx=4)
         _lbl("Host", 4)
@@ -490,36 +533,73 @@ class HubGUI:
         _lbl("Port", 4)
         T.styled_entry(row, pp_v, width=5, accent="teal").pack(side="left", ipady=5, padx=4)
 
-        status_lbl = tk.Label(row, text="● Offline", font=T.font(11), fg=c["red"], bg=c["card"])
+        initial_status = "● Disconnected" if peer_type == "external" else "● Offline"
+        status_lbl = tk.Label(row, text=initial_status, font=T.font(11), fg=c["red"], bg=c["card"])
         status_lbl._bg_level = "card"
         status_lbl.pack(side="left", padx=6)
         T.register(lambda w=status_lbl: w.configure(bg=T.current()["card"]))
 
-        start_btn = T.accent_button(row, "Start Peer", "grey",
-            command=lambda: self._start_one(pid_v, ph_v, pp_v, status_lbl, start_btn, stop_btn),
-            padx=24, pady=10)
-        start_btn.config(width=12)
-        start_btn.pack(side="right", padx=8)
+        # Connect to Peer - starts/connects only when pressed (no auto-connect)
+        connect_single_btn = T.accent_button(row, "Connect to Peer", "teal",
+            command=lambda: self._connect_single_peer(pid_v, ph_v, pp_v, type_var, status_lbl,
+                connect_single_btn, disconnect_btn),
+            padx=20, pady=8)
+        connect_single_btn.config(width=14)
 
-        stop_btn = T.accent_button(row, "Stop Peer", "grey",
-            command=lambda: self._stop_one(pid_v, ph_v, pp_v, status_lbl, start_btn, stop_btn),
-            padx=24, pady=10)
-        stop_btn.config(width=12)
-        stop_btn.config(state="disabled", bg=c["bg3"], fg=c["text"])
-        stop_btn.pack(side="right", padx=8)
+        # Disconnect - shown when connected
+        disconnect_btn = T.accent_button(row, "Disconnect", "grey",
+            command=lambda: self._disconnect_peer(pid_v, ph_v, pp_v, type_var, status_lbl,
+                connect_single_btn, disconnect_btn),
+            padx=20, pady=8)
+        disconnect_btn.config(width=12)
+        disconnect_btn.config(state="disabled", bg=c["bg3"], fg=c["text"])
 
-        self._peer_rows.append((pid_v, ph_v, pp_v, status_lbl, start_btn, stop_btn))
+        row._connect_single_btn = connect_single_btn
+        row._disconnect_btn = disconnect_btn
+
+        # Type menu - no network calls on change, just UI update
+        def _on_type_change(*_):
+            self._on_peer_type_change(row, type_var, pid_v, ph_v, pp_v, status_lbl,
+                connect_single_btn, disconnect_btn)
+        type_menu = tk.OptionMenu(type_frame, type_var, "local", "external", command=_on_type_change)
+        type_menu.config(bg=c["card"], fg=c["text"], font=T.font(11), width=8)
+        type_menu.pack(side="left")
+        T.register(lambda m=type_menu: m.configure(bg=T.current()["card"], fg=T.current()["text"]))
+
+        self._show_buttons_for_type(row, type_var.get())
+
+        self._peer_rows.append((pid_v, ph_v, pp_v, type_var, status_lbl, connect_single_btn, disconnect_btn))
+
+    def _show_buttons_for_type(self, row, peer_type):
+        """Show Connect and Disconnect buttons (same for both types)."""
+        connect_single_btn = row._connect_single_btn
+        disconnect_btn = row._disconnect_btn
+        connect_single_btn.pack(side="right", padx=8)
+        disconnect_btn.pack(side="right", padx=8)
+
+    def _on_peer_type_change(self, row, type_var, pid_v, ph_v, pp_v, status_lbl, connect_single_btn, disconnect_btn):
+        """When user switches peer type - UI only, no network calls."""
+        peer_type = type_var.get()
+        c = T.current()
+        status_lbl.config(text="● Offline" if peer_type == "local" else "● Disconnected", fg=c["red"])
+        connect_single_btn.config(state="normal", bg=c["teal"], fg="#ffffff" if T.is_dark() else "#000000")
+        disconnect_btn.config(state="disabled", bg=c["bg3"], fg=c["text"])
+        self._show_buttons_for_type(row, peer_type)
 
     # user clicked Add Peer - add another row with next peer number
     def _on_add_peer(self):
-        n = len(self._peer_rows) + 1
-        self._add_peer("peer" + str(n), "127.0.0.1", str(9000 + n))
-        self.root.update_idletasks()
-        self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
-        log("Added peer" + str(n))
+        try:
+            n = len(self._peer_rows) + 1
+            self._add_peer("peer" + str(n), "127.0.0.1", str(9000 + n))
+            self.root.update_idletasks()
+            self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
+            log("Added peer" + str(n))
+        except Exception as e:
+            log("ERROR adding peer: " + str(e))
+            messagebox.showerror("Add Peer Failed", str(e))
 
-    # start a single peer - run server thread and register with tracker
-    def _start_one(self, pid_v, ph_v, pp_v, status_lbl, start_btn, stop_btn):
+    # Connect to Peer - starts server (local) or verifies (external), then registers. Only runs when pressed.
+    def _connect_single_peer(self, pid_v, ph_v, pp_v, type_var, status_lbl, connect_single_btn, disconnect_btn):
         pid = pid_v.get().strip()
         host = ph_v.get().strip()
         try:
@@ -529,69 +609,95 @@ class HubGUI:
             return
         th = self.th_v.get().strip()
         tp = int(self.tp_v.get().strip())
+        peer_type = type_var.get()
 
         def worker():
-            t = threading.Thread(target=run_peer_server, args=(host, port, pid), daemon=True)
-            t.start()
-            ok = register_with_tracker(th, tp, pid, host, port)
-
-            def update_gui():
-                c = T.current()
+            if peer_type == "local":
+                # Start peer server, then register with tracker
+                t = threading.Thread(target=run_peer_server, args=(host, port, pid), daemon=True)
+                t.start()
+                ok = register_with_tracker(th, tp, pid, host, port)
+                def update_gui():
+                    c = T.current()
+                    if ok:
+                        status_lbl.config(text="● Online", fg=c["green"])
+                        log("Connected to " + pid)
+                    else:
+                        status_lbl.config(text="● No tracker", fg=c["yellow"])
+                        log(pid + " started but tracker unreachable")
+                    connect_single_btn.config(state="disabled", bg=c["bg3"], fg=c["text"])
+                    disconnect_btn.config(state="normal", bg=c["grey"], fg="#ffffff" if T.is_dark() else "#000000")
+                self.root.after(0, update_gui)
+            else:
+                # External: verify with PING, then register
+                ok = verify_external_peer(host, port)
                 if ok:
-                    status_lbl.config(text="● Online", fg=c["green"])
-                    log("Started " + pid)
-                else:
-                    status_lbl.config(text="● No tracker", fg=c["yellow"])
-                    log(pid + " started but tracker unreachable")
-                start_btn.config(state="disabled", bg=c["bg3"], fg=c["text"])
-                stop_btn.config(state="normal", bg=c["grey"], fg="#ffffff" if T.is_dark() else "#000000")
-
-            self.root.after(0, update_gui)
+                    ok = register_with_tracker(th, tp, pid, host, port)
+                def update_gui():
+                    c = T.current()
+                    if ok:
+                        status_lbl.config(text="● Connected", fg=c["green"])
+                        connect_single_btn.config(state="disabled", bg=c["bg3"], fg=c["text"])
+                        disconnect_btn.config(state="normal", bg=c["grey"], fg="#ffffff" if T.is_dark() else "#000000")
+                        log("Connected to " + pid)
+                    else:
+                        status_lbl.config(text="● Disconnected", fg=c["red"])
+                        log("Failed to connect to " + pid)
+                self.root.after(0, update_gui)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    # stop a single peer - close its socket so the server thread exits
-    def _stop_one(self, pid_v, ph_v, pp_v, status_lbl, start_btn, stop_btn):
+    # Disconnect - stops peer (local) and unregisters from tracker
+    def _disconnect_peer(self, pid_v, ph_v, pp_v, type_var, status_lbl, connect_single_btn, disconnect_btn):
         pid = pid_v.get().strip()
-        try:
-            port = int(pp_v.get().strip())
-        except ValueError:
-            return
-        th = self.th_v.get().strip()
-        tp = int(self.tp_v.get().strip())
-        stop_peer(port)
-        unregister_with_tracker(th, tp, pid)
+        peer_type = type_var.get()
         c = T.current()
-        status_lbl.config(text="● Offline", fg=c["red"])
-        start_btn.config(state="normal", bg=c["grey"], fg="#ffffff" if T.is_dark() else "#000000")
-        stop_btn.config(state="disabled", bg=c["bg3"], fg=c["text"])
-        log("Stopped " + pid)
+        # Update UI immediately
+        status_lbl.config(text="● Offline" if peer_type == "local" else "● Disconnected", fg=c["red"])
+        connect_single_btn.config(state="normal", bg=c["teal"], fg="#ffffff" if T.is_dark() else "#000000")
+        disconnect_btn.config(state="disabled", bg=c["bg3"], fg=c["text"])
+        log("Disconnected from " + pid)
 
-    # start any peer that hasnt been started yet
-    def _start_all_peers(self):
-        for pid_v, ph_v, pp_v, status_lbl, start_btn, stop_btn in self._peer_rows:
-            if start_btn["state"] == "normal":
-                self._start_one(pid_v, ph_v, pp_v, status_lbl, start_btn, stop_btn)
+        def _do_disconnect():
+            th = self.th_v.get().strip()
+            tp = int(self.tp_v.get().strip())
+            try:
+                port = int(pp_v.get().strip())
+                if peer_type == "local":
+                    stop_peer(port)
+            except (ValueError, Exception):
+                pass
+            unregister_with_tracker(th, tp, pid)
+        threading.Thread(target=_do_disconnect, daemon=True).start()
+
+    # Connect all peers that are not yet connected
+    def _connect_all_peers(self):
+        for row_data in self._peer_rows:
+            pid_v, ph_v, pp_v, type_var, status_lbl, connect_single_btn, disconnect_btn = row_data
+            if connect_single_btn["state"] == "normal":
+                self._connect_single_peer(pid_v, ph_v, pp_v, type_var, status_lbl, connect_single_btn, disconnect_btn)
 
     # check which peers are actually online and update the status labels
     def _verify_peers(self):
         peers = []
-        for p, h, pp, _, _, _ in self._peer_rows:
-            pid = p.get().strip()
-            host = h.get().strip()
-            port_s = pp.get().strip()
+        for row_data in self._peer_rows:
+            pid_v, ph_v, pp_v, type_var, _, _, _ = row_data
+            pid = pid_v.get().strip()
+            host = ph_v.get().strip()
+            port_s = pp_v.get().strip()
             if pid and host and port_s:
-                peers.append((pid, host, port_s))
+                peers.append((pid, host, port_s, type_var.get()))
         if not peers:
             self.verify_lbl.config(text="No peers configured")
             return
-        # try to connect to each one
+        # try to connect to each one (local: socket check, external: PING/PONG)
         active = []
         inactive = []
-        for pid, host, port_s in peers:
+        for pid, host, port_s, peer_type in peers:
             try:
                 port = int(port_s)
-                if verify_peer(host, port):
+                ok = verify_peer(host, port) if peer_type == "local" else verify_external_peer(host, port)
+                if ok:
                     active.append(pid)
                 else:
                     inactive.append(pid)
@@ -606,16 +712,17 @@ class HubGUI:
         # clear old status labels and add new ones showing each peer
         for widget in self.peer_status_frame.winfo_children():
             widget.destroy()
-        for pid, host, port_s in peers:
+        for pid, host, port_s, peer_type in peers:
             try:
                 port = int(port_s)
-                ok = verify_peer(host, port)
+                ok = verify_peer(host, port) if peer_type == "local" else verify_external_peer(host, port)
             except ValueError:
                 ok = False
             status_char = "●" if ok else "○"
             fg_color = c["green"] if ok else c["text3"]
+            type_tag = " [ext]" if peer_type == "external" else ""
             lbl = tk.Label(self.peer_status_frame,
-                text="  " + pid + " (" + host + ":" + port_s + "): " + status_char,
+                text="  " + pid + type_tag + " (" + host + ":" + port_s + "): " + status_char,
                 font=T.font(11), fg=fg_color, bg=c["card"])
             lbl.pack(anchor="w")
             T.register(lambda w=lbl: w.configure(bg=T.current()["card"]))
@@ -637,23 +744,29 @@ class HubGUI:
             messagebox.showwarning("No file", "Please select a file first.")
             return
         peers = []
-        for p, h, pp, _, _, _ in self._peer_rows:
-            pid = p.get().strip()
-            host = h.get().strip()
-            port_s = pp.get().strip()
+        for row_data in self._peer_rows:
+            pid_v, ph_v, pp_v, type_var, status_lbl, _, _ = row_data
+            pid = pid_v.get().strip()
+            host = ph_v.get().strip()
+            port_s = pp_v.get().strip()
             if pid and host and port_s:
-                peers.append((pid, host, port_s))
+                peers.append((pid, host, port_s, type_var.get()))
         if len(peers) < 2:
             messagebox.showwarning("Too few peers", "At least 2 peers required.")
             return
-        # only use peers that are actually online
+        # only use peers that are actually online (local: socket check, external: PING/PONG)
         active = []
-        for pid, h, pp in peers:
-            if verify_peer(h, int(pp)):
-                active.append((pid, h, int(pp)))
+        for pid, h, pp, peer_type in peers:
+            try:
+                port = int(pp)
+                ok = verify_peer(h, port) if peer_type == "local" else verify_external_peer(h, port)
+                if ok:
+                    active.append((pid, h, port))
+            except ValueError:
+                pass
         if len(active) < 2:
             messagebox.showwarning("Peers offline",
-                "Only " + str(len(active)) + " peer(s) reachable. Start peers and verify first.")
+                "Only " + str(len(active)) + " peer(s) reachable. Start/connect peers and verify first.")
             return
 
         self.send_btn.config(state="disabled", bg=T.current()["bg3"], fg=T.current()["text"])
@@ -742,7 +855,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--tracker-host", default="127.0.0.1")
     parser.add_argument("--tracker-port", type=int, default=9000)
+    parser.add_argument("--peer-only", action="store_true",
+        help="Run only the peer server (for external devices). Use with --peer-id, --host, --port.")
+    parser.add_argument("--peer-id", default="external")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=9001)
     args = parser.parse_args()
+
+    if args.peer_only:
+        # Standalone peer for external devices - just listens, no GUI, no tracker registration.
+        # The main hub will "Connect to Peer" and register this peer with its tracker.
+        print("[PEER] Running peer-only mode: " + args.peer_id + " on " + args.host + ":" + str(args.port))
+        print("[PEER] Use 'Connect to Peer' from the main hub to register this peer.")
+        run_peer_server(args.host, args.port, args.peer_id)
+        return
 
     # create window and run the gui
     root = T.make_window("P2P File Share", w=680, h=880)
